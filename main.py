@@ -9,12 +9,13 @@ import threading
 import time
 from typing import Optional
 
+import httpx
 import numpy as np
 import sounddevice as sd
 from evdev import InputDevice, ecodes, list_devices
 from faster_whisper import WhisperModel
 from scipy.io import wavfile
-
+from sympy.codegen.ast import continue_
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +29,35 @@ HOTKEY = ecodes.KEY_F8
 HOTKEY_NAME = "F8"
 HOTKEY_DEBOUNCE_SECONDS = 0.30
 
+OLLAMA_URL = "http://127.0.0.1:11434"
+OLLAMA_MODEL = "qwen2.5:7b"
+OLLAMA_TIMEOUT = 20.0
+
+TECH_TERMS = [
+    "OpenClaw",
+    "Ollama",
+    "Whisper",
+    "faster-whisper",
+    "Python",
+    "Linux",
+    "Arch Linux",
+    "Hyprland",
+    "Wayland",
+    "DevAgentXD",
+    "accessAI",
+    "Kwork",
+    "DeepSeek",
+    "OpenAI",
+    "Claude",
+    "Gemini",
+    "GitHub",
+    "PyCharm",
+    "VS Code",
+    "CLI",
+    "API",
+    "JSON",
+]
+
 
 class VoiceToTextApp:
     def __init__(self) -> None:
@@ -40,17 +70,107 @@ class VoiceToTextApp:
         self.stream: Optional[sd.InputStream] = None
         self.running = True
         self.last_hotkey_ts = 0.0
+        self.was_playing = False
 
-        whisper_device = os.environ.get("WHISPER_DEVICE", "cpu").strip().lower()
-        compute_type = "int8" if whisper_device == "cpu" else "float16"
+        model_name = os.environ.get("WHISPER_MODEL", "large-v3").strip()
 
         logging.info("Loading model...")
-        self.model = WhisperModel(
-            "large-v3",
-            device=whisper_device,
-            compute_type=compute_type,
-        )
-        logging.info("Model loaded (device=%s, compute_type=%s)", whisper_device, compute_type)
+
+        try:
+            logging.info("Trying CUDA GPU...")
+            self.model = WhisperModel(
+                model_name,
+                device="cuda",
+                compute_type="float16",
+            )
+            logging.info("Model loaded on CUDA GPU")
+
+        except Exception:
+            logging.exception("CUDA failed, falling back to CPU")
+
+            self.model = WhisperModel(
+                model_name,
+                device="cpu",
+                compute_type="int8",
+            )
+            logging.info("Model loaded on CPU")
+
+    def postprocess_text_with_ollama(self, text: str) -> str:
+        """
+        Постобработка текста через Ollama LLM.
+        Исправляет опечатки, термины, добавляет пунктуацию.
+        При ошибке возвращает исходный текст.
+        """
+        if not text.strip():
+            return text
+
+        terms_list = ", ".join(TECH_TERMS)
+
+        prompt = f"""Ты модуль постобработки текста после speech-to-text.
+
+Твоя задача:
+исправить ошибки распознавания речи, опечатки, пунктуацию, регистр букв и технические термины.
+
+Жёсткие правила вывода:
+1. Верни только исправленный текст.
+2. Не пиши вступления.
+3. Не пиши "Вот исправленный текст:".
+4. Не объясняй изменения.
+5. Не отвечай на смысл текста.
+6. Не добавляй новые факты.
+7. Не удаляй смысловые части.
+8. Не меняй стиль автора без причины.
+9. Не используй Markdown.
+10. Не оборачивай ответ в кавычки.
+11. Если текст уже нормальный, верни его почти без изменений.
+
+Словарь терминов, которые нужно сохранять:
+{terms_list}
+
+Исправляемый текст:
+<<<
+{text}
+>>>
+
+Верни только исправленный текст."""
+
+        try:
+            logging.info("Starting Ollama postprocessing with model: %s", OLLAMA_MODEL)
+
+            with httpx.Client(timeout=OLLAMA_TIMEOUT) as client:
+                response = client.post(
+                    f"{OLLAMA_URL}/api/generate",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                    },
+                )
+
+                if response.status_code != 200:
+                    logging.error("Ollama returned status %d: %s", response.status_code, response.text)
+                    return text
+
+                data = response.json()
+                processed = data.get("response", "").strip()
+
+                if not processed:
+                    logging.warning("Ollama returned empty response, using original text")
+                    return text
+
+                logging.info("Ollama postprocessing completed")
+                return processed
+
+        except httpx.TimeoutException:
+            logging.error("Ollama request timeout after %.1f seconds, using original text", OLLAMA_TIMEOUT)
+            return text
+        except httpx.ConnectError:
+            logging.error("Cannot connect to Ollama at %s, using original text", OLLAMA_URL)
+            return text
+        except Exception:
+            logging.exception("Ollama postprocessing failed, using original text")
+            return text
+
 
     def audio_callback(self, indata, frames, time_info, status) -> None:
         if status:
@@ -62,9 +182,50 @@ class VoiceToTextApp:
         with self.recording_lock:
             self.recording_chunks.append(indata.copy())
 
+    def pause_audio (self) -> None: # To pause the player, during recording
+        self.was_playing = False
+
+        try:
+            result = subprocess.run(
+                ["playerctl", "status"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            if result.returncode == 0:
+                status = result.stdout.strip()
+
+                if status == "Playing":
+                    self.was_playing = True
+                    logging.warning("Player paused, starting recording...")
+
+                    subprocess.run(["playerctl", "pause"], check=True)
+
+                else:
+                    logging.warning("Player paused, starting recording...")
+
+        except Exception:
+            logging.exception("Failed to pause audio")
+
+    def restore_audio(self) -> None: # To restore the player, after recording
+        if not self.was_playing:
+            return
+
+        try:
+            logging.info("Resuming audio playback...")
+            subprocess.run(["playerctl", "play"], check=True)
+            self.was_playing = False
+
+        except Exception:
+            logging.exception("Failed to resume audio")
+
     def start_recording(self) -> None:
         if self.is_recording:
             return
+
+        subprocess.Popen(["notify-send", "Recording started", "Press F8 to stop"])
+        self.pause_audio()
 
         try:
             with self.recording_lock:
@@ -88,7 +249,8 @@ class VoiceToTextApp:
     def stop_recording(self) -> None:
         if not self.is_recording:
             return
-
+        subprocess.Popen(["notify-send", "Recording stopped", "Press F8 to start"])
+        self.restore_audio()
         logging.info("Stopping recording...")
         self.is_recording = False
 
@@ -151,13 +313,20 @@ class VoiceToTextApp:
                         if piece:
                             parts.append(piece)
 
-                text = " ".join(parts).strip()
-                logging.info("Recognized: %s", text)
+                raw_text = " ".join(parts).strip()
+                logging.info("Raw recognized text: %s", raw_text)
 
-                if text:
-                    self.insert_text(text)
-                else:
+                if not raw_text:
                     logging.info("Nothing recognized")
+                    return
+
+                final_text = self.postprocess_text_with_ollama(raw_text)
+                logging.info("Final text after postprocessing: %s", final_text)
+
+                if final_text:
+                    self.insert_text(final_text)
+                else:
+                    logging.warning("Postprocessing returned empty text")
 
             except Exception:
                 logging.exception("Transcription failed")
