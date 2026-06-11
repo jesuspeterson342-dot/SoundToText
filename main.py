@@ -9,7 +9,6 @@ import threading
 import time
 from typing import Optional
 
-import httpx
 import numpy as np
 import sounddevice as sd
 from evdev import InputDevice, ecodes, list_devices
@@ -28,36 +27,6 @@ LANGUAGE = "ru"
 HOTKEY = ecodes.KEY_F8
 HOTKEY_NAME = "F8"
 HOTKEY_DEBOUNCE_SECONDS = 0.30
-
-OLLAMA_URL = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "qwen2.5:7b"
-OLLAMA_TIMEOUT = 20.0
-
-TECH_TERMS = [
-    "OpenClaw",
-    "Ollama",
-    "Whisper",
-    "faster-whisper",
-    "Python",
-    "Linux",
-    "Arch Linux",
-    "Hyprland",
-    "Wayland",
-    "DevAgentXD",
-    "accessAI",
-    "Kwork",
-    "DeepSeek",
-    "OpenAI",
-    "Claude",
-    "Gemini",
-    "GitHub",
-    "PyCharm",
-    "VS Code",
-    "CLI",
-    "API",
-    "JSON",
-]
-
 
 class VoiceToTextApp:
     def __init__(self) -> None:
@@ -94,83 +63,6 @@ class VoiceToTextApp:
                 compute_type="int8",
             )
             logging.info("Model loaded on CPU")
-
-    def postprocess_text_with_ollama(self, text: str) -> str:
-        """
-        Постобработка текста через Ollama LLM.
-        Исправляет опечатки, термины, добавляет пунктуацию.
-        При ошибке возвращает исходный текст.
-        """
-        if not text.strip():
-            return text
-
-        terms_list = ", ".join(TECH_TERMS)
-
-        prompt = f"""Ты модуль постобработки текста после speech-to-text.
-
-Твоя задача:
-исправить ошибки распознавания речи, опечатки, пунктуацию, регистр букв и технические термины.
-
-Жёсткие правила вывода:
-1. Верни только исправленный текст.
-2. Не пиши вступления.
-3. Не пиши "Вот исправленный текст:".
-4. Не объясняй изменения.
-5. Не отвечай на смысл текста.
-6. Не добавляй новые факты.
-7. Не удаляй смысловые части.
-8. Не меняй стиль автора без причины.
-9. Не используй Markdown.
-10. Не оборачивай ответ в кавычки.
-11. Если текст уже нормальный, верни его почти без изменений.
-
-Словарь терминов, которые нужно сохранять:
-{terms_list}
-
-Исправляемый текст:
-<<<
-{text}
->>>
-
-Верни только исправленный текст."""
-
-        try:
-            logging.info("Starting Ollama postprocessing with model: %s", OLLAMA_MODEL)
-
-            with httpx.Client(timeout=OLLAMA_TIMEOUT) as client:
-                response = client.post(
-                    f"{OLLAMA_URL}/api/generate",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "prompt": prompt,
-                        "stream": False,
-                    },
-                )
-
-                if response.status_code != 200:
-                    logging.error("Ollama returned status %d: %s", response.status_code, response.text)
-                    return text
-
-                data = response.json()
-                processed = data.get("response", "").strip()
-
-                if not processed:
-                    logging.warning("Ollama returned empty response, using original text")
-                    return text
-
-                logging.info("Ollama postprocessing completed")
-                return processed
-
-        except httpx.TimeoutException:
-            logging.error("Ollama request timeout after %.1f seconds, using original text", OLLAMA_TIMEOUT)
-            return text
-        except httpx.ConnectError:
-            logging.error("Cannot connect to Ollama at %s, using original text", OLLAMA_URL)
-            return text
-        except Exception:
-            logging.exception("Ollama postprocessing failed, using original text")
-            return text
-
 
     def audio_callback(self, indata, frames, time_info, status) -> None:
         if status:
@@ -303,7 +195,47 @@ class VoiceToTextApp:
                         temperature=0.0,
                         condition_on_previous_text=False,
                         vad_filter=False,
-                        initial_prompt="Это русская диктовка. Распознавай только русский текст, без перевода на английский."
+                        initial_prompt="""
+Это личная русская диктовка.
+
+Задача:
+распознавать речь максимально грамотно.
+
+Правила:
+
+- Исправляй очевидные орфографические ошибки распознавания.
+- Расставляй знаки препинания естественно.
+- Начинай предложения с заглавной буквы.
+- Сохраняй стиль автора.
+- Не сокращай текст.
+- Не пересказывай текст.
+- Не добавляй новые мысли.
+- Не отвечай на вопросы автора.
+- Не меняй смысл сказанного.
+
+Технические термины сохраняй в оригинальном написании:
+
+Python
+Linux
+Arch Linux
+Hyprland
+Wayland
+OpenAI
+DeepSeek
+Claude
+Gemini
+GitHub
+Ollama
+Whisper
+DevAgentXD
+accessAI
+JSON
+API
+CLI
+VS Code
+PyCharm
+
+Если слышен русский текст, верни грамотный русский текст так, как его написал бы человек, хорошо владеющий русским языком."""
                     )
 
                     parts = []
@@ -320,13 +252,7 @@ class VoiceToTextApp:
                     logging.info("Nothing recognized")
                     return
 
-                final_text = self.postprocess_text_with_ollama(raw_text)
-                logging.info("Final text after postprocessing: %s", final_text)
-
-                if final_text:
-                    self.insert_text(final_text)
-                else:
-                    logging.warning("Postprocessing returned empty text")
+                self.insert_text(raw_text)
 
             except Exception:
                 logging.exception("Transcription failed")
